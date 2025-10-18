@@ -1,4 +1,8 @@
-from virttest import data_dir, env_process, error_context
+import os
+import re
+import time
+from avocado.utils import download
+from virttest import data_dir, env_process, error_context, utils_misc
 
 
 @error_context.context_aware
@@ -140,6 +144,97 @@ def run(test, params, env):
             test.fail("RHEL test failed: %s" % output)
         test.log.info("WSL2 with RHEL installed and verified successfully")
         return new_session
+    
+    def install_mysql_service():
+        """
+        Install and start MySQL service in Windows VM.
+        Downloads installer at runtime if URL is provided.
+        """
+        error_context.context("Installing MySQL service in guest")
+
+        # Check if installed
+        installed = session.cmd_status(mysql_check_installed_cmd) == 0
+
+        if not installed:
+            # Install MySQL
+            error_context.context("Installing MySQL Server", test.log.info)
+
+            # Check if we should download at runtime
+            download_url = params.get("mysql_download_url")
+
+            if download_url:
+                # RUNTIME DOWNLOAD PATTERN
+                tmp_dir = data_dir.get_tmp_dir()
+                pkg_md5sum = params.get("mysql_pkg_md5sum", "")
+
+                error_context.context("Downloading MySQL installer", test.log.info)
+                pkg_name = os.path.basename(download_url)
+                pkg_path = os.path.join(tmp_dir, pkg_name)
+
+                test.log.info("Downloading from: %s" % download_url)
+                test.log.info("Download destination: %s" % pkg_path)
+
+                # Download to host
+                if pkg_md5sum:
+                    download.get_file(download_url, pkg_path, hash_expected=pkg_md5sum)
+                else:
+                    download.get_file(download_url, pkg_path)
+
+                test.log.info("Download completed, copying to guest...")
+
+                # Copy to guest
+                dst = r"c:\\"
+                vm.copy_files_to(pkg_path, dst)
+
+                # Update install command to use downloaded file
+                install_cmd = mysql_install_cmd.replace("DRIVE:\\", dst)
+                test.log.info("Using downloaded installer: %s" % install_cmd)
+            else:
+                # Use existing pattern (from winutils)
+                test.log.info("Using installer from winutils")
+                dst = r"%s:\\" % utils_misc.get_winutils_vol(session)
+                install_cmd = re.sub(r"DRIVE:\\+", dst, mysql_install_cmd)
+
+            # Install
+            test.log.info("Installing MySQL (this may take 3-5 minutes)...")
+            status, output = session.cmd_status_output(install_cmd, timeout=600)
+            if status != 0:
+                test.fail("MySQL installation failed: %s" % output)
+
+            test.log.info("MySQL installation completed successfully")
+            test.log.info("Waiting 30 seconds for post-install tasks...")
+            time.sleep(30)
+
+            # Verify
+            if session.cmd_status(mysql_check_installed_cmd) != 0:
+                test.fail("MySQL installation verification failed")
+        
+        # Check service status
+        error_context.context("Checking MySQL service status", test.log.info)
+        status, service_output = session.cmd_status_output(mysql_check_service_cmd)
+        
+        if status != 0:
+            test.fail("MySQL service not found: %s" % service_output)
+        
+        # Start if stopped
+        if "STOPPED" in service_output.upper():
+            error_context.context("Starting MySQL service", test.log.info)
+            status, start_output = session.cmd_status_output(
+                mysql_start_service_cmd, timeout=60
+            )
+            if status != 0:
+                test.fail("Failed to start MySQL: %s" % start_output)
+            time.sleep(10)
+        
+        # Verify running
+        status, verify_output = session.cmd_status_output(mysql_check_service_cmd)
+        if "RUNNING" not in verify_output.upper():
+            test.fail("MySQL service not running")
+        
+        test.log.info("MySQL service installed and running successfully")
+        return session
+    
+    
 
     login_timeout = int(params.get("login_timeout", 360))
     params["ovmf_vars_filename"] = "OVMF_VARS.secboot.fd"
@@ -167,6 +262,11 @@ def run(test, params, env):
     wsl_list_cmd = params["wsl_list_cmd"]
     rhel_distro_name = params["rhel_distro_name"]
     rhel_test_cmd = params["rhel_test_cmd"]
+    # Added MySQL params here
+    mysql_install_cmd = params["mysql_install_cmd"]
+    mysql_check_installed_cmd = params["mysql_check_installed_cmd"]
+    mysql_start_service_cmd = params["mysql_start_service_cmd"]
+    mysql_check_service_cmd = params["mysql_check_service_cmd"]
 
     try:
         check_secure_boot_enabled()
@@ -183,6 +283,9 @@ def run(test, params, env):
                 test.fail("VBS is not enabled after reboot.")
 
         session = install_wsl2_and_rhel()
+        
+        session = install_mysql_service()
+        
         run_device_guard_tool(disable_command, vbs_disable_info)
     except Exception as e:
         test.fail(f"Test failed: {e}")
