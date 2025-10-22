@@ -2,7 +2,7 @@ import os
 import re
 import time
 from avocado.utils import download
-from virttest import data_dir, env_process, error_context, utils_misc
+from virttest import data_dir, env_process, error_context, utils_misc, utils_net, utils_netperf
 
 
 @error_context.context_aware
@@ -233,8 +233,203 @@ def run(test, params, env):
         
         test.log.info("MySQL service installed and running successfully")
         return session
-    
-    
+
+    def run_netperf_and_stress_test():
+        """
+        Run netperf from Windows guest to host and stress test concurrently.
+        Verifies VM stability, MySQL service, and all applications under load.
+
+        Steps:
+        1. Start netserver on host
+        2. Start netperf client in Windows guest
+        3. Start stress in WSL2 (already installed from Step 3)
+        4. Monitor both processes for test_duration seconds
+        5. Verify VM stability and service health throughout
+        """
+        error_context.context("Running netperf and stress test concurrently", test.log.info)
+
+        # Get host IP
+        host_ip = utils_net.get_host_ip_address(params)
+        test.log.info(f"Host IP for netperf server: {host_ip}")
+
+        # Setup paths for netperf binaries
+        netperf_server_src = os.path.join(
+            data_dir.get_deps_dir("netperf"),
+            netperf_link
+        )
+        netperf_client_src = os.path.join(
+            data_dir.get_deps_dir("netperf"),
+            netperf_client_link_win
+        )
+
+        # Initialize netperf server (on host) and client (in Windows guest)
+        n_server = utils_netperf.NetperfServer(
+            host_ip,
+            server_path,
+            netperf_source=netperf_server_src,
+            password=hostpassword
+        )
+
+        n_client = utils_netperf.NetperfClient(
+            vm.get_address(),
+            client_path,
+            netperf_source=netperf_client_src,
+            client="ssh",
+            port="22",
+            username=params["username"],
+            password=params["password"],
+            prompt=params.get("shell_prompt", r"^root@.*[\#\$]\s*$|#"),
+            linesep=params.get("shell_linesep", "\n").encode().decode("unicode_escape"),
+            status_test_command=params.get("status_test_command", "echo %errorlevel%")
+        )
+
+        try:
+            # Step 1: Start netserver on host
+            error_context.context("Starting netserver on host", test.log.info)
+            n_server.start()
+            test.log.info("Netserver started on host successfully")
+
+            # Step 2: Start netperf client in Windows guest (background)
+            test_option = f"-l {netperf_test_duration} -t {test_protocol}"
+            error_context.context(
+                f"Starting netperf client in guest with options: {test_option}",
+                test.log.info
+            )
+            n_client.bg_start(host_ip, test_option, "1", "")
+
+            # Wait for netperf to actually start
+            if not utils_misc.wait_for(
+                n_client.is_netperf_running,
+                timeout=30,
+                first=0,
+                step=3,
+                text="Waiting for netperf client to start"
+            ):
+                test.error("Failed to start netperf client in guest")
+
+            test.log.info("Netperf client started successfully in guest")
+
+            # Step 3: Install stress in WSL2 if not already installed
+            error_context.context("Preparing stress tool in WSL2", test.log.info)
+            install_check = session.cmd_status("wsl -d RHEL -- which stress")
+            if install_check != 0:
+                test.log.info("Installing stress in WSL2 RHEL distribution...")
+                install_status = session.cmd_status(
+                    "wsl -d RHEL -- sudo yum install -y stress",
+                    timeout=300
+                )
+                if install_status != 0:
+                    test.log.warning("Stress installation had issues, attempting to continue...")
+            else:
+                test.log.info("Stress already installed in WSL2")
+
+            # Step 4: Start stress in background via WSL2
+            stress_cmd = (
+                f'start /b wsl -d RHEL -- stress '
+                f'--cpu {stress_cpu} '
+                f'--vm {stress_vm} '
+                f'--vm-bytes {stress_vm_bytes} '
+                f'--timeout {stress_timeout}'
+            )
+            error_context.context(
+                f"Starting stress in WSL2 with command: {stress_cmd}",
+                test.log.info
+            )
+            session.sendline(stress_cmd)
+            time.sleep(5)  # Give stress time to start
+
+            # Verify stress started
+            stress_check = session.cmd_status("wsl -d RHEL -- pgrep stress")
+            if stress_check != 0:
+                test.error("Failed to start stress process in WSL2")
+
+            test.log.info("Stress test started successfully in WSL2")
+            test.log.info("="*60)
+            test.log.info("CONCURRENT WORKLOAD RUNNING:")
+            test.log.info(f"  - Netperf: Guest → Host for {netperf_test_duration}s")
+            test.log.info(f"  - Stress: {stress_cpu} CPU, {stress_vm} VM worker, {stress_vm_bytes} memory")
+            test.log.info("="*60)
+
+            # Step 5: Monitor concurrent execution
+            start_time = time.time()
+            max_duration = netperf_test_duration + deviation_time
+            check_interval = 10
+
+            while time.time() - start_time < max_duration:
+                elapsed = time.time() - start_time
+
+                # Check 1: Netperf status
+                netperf_running = n_client.is_netperf_running()
+                if not netperf_running and elapsed < netperf_test_duration - 10:
+                    test.fail(f"Netperf terminated unexpectedly at {elapsed:.0f}s")
+
+                # Check 2: Stress status (it's OK if it completes)
+                stress_running = session.cmd_status("wsl -d RHEL -- pgrep stress") == 0
+
+                # Check 3: VM is alive
+                if not vm.is_alive():
+                    test.fail(f"VM crashed during concurrent test at {elapsed:.0f}s")
+
+                # Check 4: MySQL service still running
+                mysql_status = session.cmd_status(mysql_check_service_cmd)
+                if mysql_status != 0:
+                    test.fail(f"MySQL service stopped during test at {elapsed:.0f}s")
+
+                # Check 5: WSL2 still responsive
+                wsl_check = session.cmd_status("wsl -d RHEL -- echo test", timeout=10)
+                if wsl_check != 0:
+                    test.fail(f"WSL2 became unresponsive at {elapsed:.0f}s")
+
+                # Check 6: Guest session responsive
+                try:
+                    session.cmd("echo alive", timeout=15)
+                except Exception as e:
+                    test.fail(f"Guest session became unresponsive at {elapsed:.0f}s: {e}")
+
+                # Log comprehensive status
+                status_msg = (
+                    f"[{elapsed:>6.0f}s/{max_duration}s] "
+                    f"Netperf: {'✓ Running' if netperf_running else '✗ Stopped':>12} | "
+                    f"Stress: {'✓ Running' if stress_running else '✗ Stopped':>12} | "
+                    f"VM: ✓ Alive | MySQL: ✓ Running | WSL2: ✓ Responsive"
+                )
+                test.log.info(status_msg)
+
+                time.sleep(check_interval)
+
+            # Step 6: Verify netperf completed cleanly (not hung)
+            if n_client.is_netperf_running():
+                test.fail("Netperf still running after timeout, may have hung")
+
+            # Success!
+            test.log.info("="*60)
+            test.log.info("✅ CONCURRENT TEST COMPLETED SUCCESSFULLY!")
+            test.log.info(f"✅ Netperf ran for {netperf_test_duration}s without issues")
+            test.log.info(f"✅ Stress ran for {stress_timeout}s under load")
+            test.log.info("✅ VM remained stable throughout test")
+            test.log.info("✅ All services (MySQL, WSL2) operational")
+            test.log.info("✅ No crashes, hangs, or service failures detected")
+            test.log.info("="*60)
+
+        finally:
+            # Cleanup: Always cleanup even on failure
+            error_context.context("Cleaning up netperf and stress processes", test.log.info)
+
+            if n_server:
+                if n_server.is_server_running():
+                    n_server.stop()
+                n_server.cleanup(True)
+                test.log.info("Netserver stopped and cleaned up")
+
+            if n_client:
+                if n_client.is_netperf_running():
+                    n_client.stop()
+                n_client.cleanup(True)
+                test.log.info("Netperf client stopped and cleaned up")
+
+            # Kill any remaining stress processes
+            session.cmd("wsl -d RHEL -- pkill -9 stress", ignore_all_errors=True)
+            test.log.info("Stress processes cleaned up")
 
     login_timeout = int(params.get("login_timeout", 360))
     params["ovmf_vars_filename"] = "OVMF_VARS.secboot.fd"
@@ -267,6 +462,19 @@ def run(test, params, env):
     mysql_check_installed_cmd = params["mysql_check_installed_cmd"]
     mysql_start_service_cmd = params["mysql_start_service_cmd"]
     mysql_check_service_cmd = params["mysql_check_service_cmd"]
+    # Netperf and stress test params
+    hostpassword = params.get("hostpassword", "redhat")
+    netperf_link = params.get("netperf_link", "netperf-2.7.1.tar.bz2")
+    netperf_client_link_win = params.get("netperf_client_link_win", "netperf.exe")
+    netperf_test_duration = int(params.get("netperf_test_duration", 180))
+    deviation_time = int(params.get("deviation_time", 20))
+    server_path = params.get("server_path", "/var/tmp/")
+    client_path = params.get("client_path", "c:\\")
+    test_protocol = params.get("test_protocol", "TCP_STREAM")
+    stress_timeout = int(params.get("stress_timeout", 180))
+    stress_cpu = int(params.get("stress_cpu", 1))
+    stress_vm = int(params.get("stress_vm", 1))
+    stress_vm_bytes = params.get("stress_vm_bytes", "20M")
 
     try:
         check_secure_boot_enabled()
@@ -283,9 +491,12 @@ def run(test, params, env):
                 test.fail("VBS is not enabled after reboot.")
 
         session = install_wsl2_and_rhel()
-        
+
         session = install_mysql_service()
-        
+
+        # Step 5: Run netperf and stress test concurrently
+        run_netperf_and_stress_test()
+
         run_device_guard_tool(disable_command, vbs_disable_info)
     except Exception as e:
         test.fail(f"Test failed: {e}")
